@@ -171,7 +171,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
 
     protected volatile ValidConnectionChecker          validConnectionChecker                    = null;
 
-    protected final Map<DruidPooledConnection, Object> activeConnections                         = new IdentityHashMap<DruidPooledConnection, Object>();
+    protected final Map<DruidPooledConnection, Object> activeConnections                         = new IdentityHashMap<DruidPooledConnection, Object>(); //[ADU]如果打开连接泄漏检查，借出的连接要放到这里，方便检查。
     protected final static Object                      PRESENT                                   = new Object();
 
     protected long                                     id;

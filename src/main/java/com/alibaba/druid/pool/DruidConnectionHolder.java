@@ -44,17 +44,17 @@ public final class DruidConnectionHolder {
     private final static Log                      LOG                      = LogFactory.getLog(DruidConnectionHolder.class);
     public static boolean                         holdabilityUnsupported   = false;
 
-    protected final DruidAbstractDataSource       dataSource;
-    protected final long                          connectionId;
-    protected final Connection                    conn;
+    protected final DruidAbstractDataSource       dataSource; //[ADU]所属的datasource
+    protected final long                          connectionId; //[ADU]连接ID
+    protected final Connection                    conn; //[ADU]SQL的核心连接
     protected final List<ConnectionEventListener> connectionEventListeners = new CopyOnWriteArrayList<ConnectionEventListener>();
     protected final List<StatementEventListener>  statementEventListeners  = new CopyOnWriteArrayList<StatementEventListener>();
-    protected final long                          connectTimeMillis;
-    protected volatile long                       lastActiveTimeMillis;
+    protected final long                          connectTimeMillis; //[ADU]创建时间
+    protected volatile long                       lastActiveTimeMillis; //[ADU]上次活跃时间
     protected volatile long                       lastExecTimeMillis;
     protected volatile long                       lastKeepTimeMillis;
     protected volatile long                       lastValidTimeMillis;
-    protected long                                useCount                 = 0;
+    protected long                                useCount                 = 0; //[ADU]被使用（借出）次数
     private long                                  keepAliveCheckCount      = 0;
     private long                                  lastNotEmptyWaitNanos;
     private final long                            createNanoSpan;
@@ -98,8 +98,8 @@ public final class DruidConnectionHolder {
         this.variables = variables;
         this.globleVariables = globleVariables;
 
-        this.connectTimeMillis = System.currentTimeMillis();
-        this.lastActiveTimeMillis = connectTimeMillis;
+        this.connectTimeMillis = System.currentTimeMillis(); //[ADU]创建时间
+        this.lastActiveTimeMillis = connectTimeMillis; //[ADU]初始时，上次活跃时间即为创建时间
         this.lastExecTimeMillis   = connectTimeMillis;
 
         this.underlyingAutoCommit = conn.getAutoCommit();
@@ -107,7 +107,7 @@ public final class DruidConnectionHolder {
         if (conn instanceof WrapperProxy) {
             this.connectionId = ((WrapperProxy) conn).getId();
         } else {
-            this.connectionId = dataSource.createConnectionId();
+            this.connectionId = dataSource.createConnectionId(); //[ADU]从10001开始
         }
 
         {

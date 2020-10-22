@@ -116,25 +116,25 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
     private int                              poolingPeak               = 0;
     private long                             poolingPeakTime           = 0;
     // store
-    private volatile DruidConnectionHolder[] connections;
-    private int                              poolingCount              = 0;
+    private volatile DruidConnectionHolder[] connections; //[ADU]可用连接池，获取(getConnection)/回收(recycle)时都在尾部操作。（获取时，从尾部移除掉；回收时，再放回尾部）
+    private int                              poolingCount              = 0; //[ADU]可用连接池中可用连接的个数，获取时-1，回收时+1。
     private int                              activeCount               = 0;
     private volatile long                    discardCount              = 0;
     private int                              notEmptyWaitThreadCount   = 0;
     private int                              notEmptyWaitThreadPeak    = 0;
     //
-    private DruidConnectionHolder[]          evictConnections;
-    private DruidConnectionHolder[]          keepAliveConnections;
+    private DruidConnectionHolder[]          evictConnections; //[ADU]要被销毁的连接会移除到这里，如长时间空闲的等。
+    private DruidConnectionHolder[]          keepAliveConnections; //[ADU]需要探测的连接池
 
     // threads
     private volatile ScheduledFuture<?>      destroySchedulerFuture;
-    private DestroyTask                      destroyTask;
+    private DestroyTask                      destroyTask; //[ADU]1）将长时间空闲的连接移至evictConnections中；2）将长时间未返回结果的连接直接释放掉。
 
     private volatile Future<?>               createSchedulerFuture;
 
-    private CreateConnectionThread           createConnectionThread;
-    private DestroyConnectionThread          destroyConnectionThread;
-    private LogStatsThread                   logStatsThread;
+    private CreateConnectionThread           createConnectionThread; //[ADU]负责创建连接的线程。如果收到empty条件通知，会创建一个连接并放入connections尾部。
+    private DestroyConnectionThread          destroyConnectionThread; //[ADU]负责运行DestroyTask的线程。每隔timeBetweenEvictionRunsMillis（默认1秒）运行一次DestroyTask。
+    private LogStatsThread                   logStatsThread; //[ADU]打印stat日志的线程，每隔timeBetweenLogStatsMillis（非正数表次不打印）打一次。
     private int                              createTaskCount;
 
     private volatile long                    createTaskIdSeed          = 1L;
@@ -160,7 +160,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
     public static ThreadLocal<Long>          waitNanosLocal            = new ThreadLocal<Long>();
     private boolean                          logDifferentThread        = true;
     private volatile boolean                 keepAlive                 = false;
-    private boolean                          asyncInit                 = false;
+    private boolean                          asyncInit                 = false; //[ADU]初始化是否异步。
     protected boolean                        killWhenSocketReadTimeout = false;
     protected boolean                        checkExecuteTime          = false;
 
@@ -788,6 +788,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         this.connectProperties = properties;
     }
 
+     //[ADU]初始化
     public void init() throws SQLException {
         if (inited) {
             return;
@@ -875,13 +876,13 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
             initFromSPIServiceLoader();
 
-            resolveDriver();
+            resolveDriver(); //[ADU]解析driverClass
 
-            initCheck();
+            initCheck(); //[ADU]对于MySQL来说，isMySql = true
 
             initExceptionSorter();
-            initValidConnectionChecker();
-            validationQueryCheck();
+            initValidConnectionChecker(); //[ADU]初始化连接检测器
+            validationQueryCheck(); //[ADU]检查testOnBorrow、testOnReturn、testWhileIdle、validationQuery的参数配置
 
             if (isUseGlobalDataSourceStat()) {
                 dataSourceStat = JdbcDataSourceStat.getGlobal();
@@ -897,23 +898,23 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             }
             dataSourceStat.setResetStatEnable(this.resetStatEnable);
 
-            connections = new DruidConnectionHolder[maxActive];
+            connections = new DruidConnectionHolder[maxActive]; //[ADU]初始化数组
             evictConnections = new DruidConnectionHolder[maxActive];
             keepAliveConnections = new DruidConnectionHolder[maxActive];
 
             SQLException connectError = null;
 
-            if (createScheduler != null && asyncInit) {
+            if (createScheduler != null && asyncInit) { //[ADU]异步创建连接
                 for (int i = 0; i < initialSize; ++i) {
                     submitCreateTask(true);
                 }
             } else if (!asyncInit) {
                 // init connections
-                while (poolingCount < initialSize) {
+                while (poolingCount < initialSize) { //[ADU]同步创建initialSize个连接
                     try {
                         PhysicalConnectionInfo pyConnectInfo = createPhysicalConnection();
                         DruidConnectionHolder holder = new DruidConnectionHolder(this, pyConnectInfo);
-                        connections[poolingCount++] = holder;
+                        connections[poolingCount++] = holder; //[ADU]放入connections
                     } catch (SQLException ex) {
                         LOG.error("init datasource error, url: " + this.getUrl(), ex);
                         if (initExceptionThrow) {
@@ -931,9 +932,9 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 }
             }
 
-            createAndLogThread();
-            createAndStartCreatorThread();
-            createAndStartDestroyThread();
+            createAndLogThread(); //[ADU]如果timeBetweenLogStatsMillis>0，开启守护线程LogStatsThread打印stat日志，线程前缀为Druid-ConnectionPool-Log-。
+            createAndStartCreatorThread(); //[ADU]开启守护线程CreateConnectionThread，如果收到empty条件信号会创建新的连接放入线程池。线程前缀为Druid-ConnectionPool-Create-。
+            createAndStartDestroyThread(); //[ADU]开启守护线程DestroyConnectionThread，如果收到empty条件信号会创建新的连接放入线程池。线程前缀为Druid-ConnectionPool-Destroy-。
 
             initedLatch.await();
             init = true;
@@ -1158,6 +1159,8 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
     }
 
+     //[ADU]检查testOnBorrow、testOnReturn、testWhileIdle、validationQuery的参数配置。
+     //[ADU]如果testOnBorrow、testOnReturn、testWhileIdle有为true的，但validationQuery为空，会打个error日志。
     private void validationQueryCheck() {
         if (!(testOnBorrow || testOnReturn || testWhileIdle)) {
             return;
@@ -1405,7 +1408,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             // handle notFullTimeoutRetry
             DruidPooledConnection poolableConnection;
             try {
-                poolableConnection = getConnectionInternal(maxWaitMillis);
+                poolableConnection = getConnectionInternal(maxWaitMillis); //[ADU]获取连接
             } catch (GetConnectionTimeoutException ex) {
                 if (notFullTimeoutRetryCnt <= this.notFullTimeoutRetryCount && !isFull()) {
                     notFullTimeoutRetryCnt++;
@@ -1417,14 +1420,14 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 throw ex;
             }
 
-            if (testOnBorrow) {
+            if (testOnBorrow) { //[ADU]如果testOnBorrow=true，则进行探测。
                 boolean validate = testConnectionInternal(poolableConnection.holder, poolableConnection.conn);
                 if (!validate) {
                     if (LOG.isDebugEnabled()) {
                         LOG.debug("skip not validate connection.");
                     }
 
-                    discardConnection(poolableConnection.holder);
+                    discardConnection(poolableConnection.holder); //[ADU]探测失败，则丢弃此连接并重新获取。
                     continue;
                 }
             } else {
@@ -1433,7 +1436,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     continue;
                 }
 
-                if (testWhileIdle) {
+                if (testWhileIdle) { //[ADU]如果testWhileIdle=true且空闲时间>timeBetweenEvictionRunsMillis,则进行探测。
                     final DruidConnectionHolder holder = poolableConnection.holder;
                     long currentTimeMillis             = System.currentTimeMillis();
                     long lastActiveTimeMillis          = holder.lastActiveTimeMillis;
@@ -1466,22 +1469,24 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                                 LOG.debug("skip not validate connection.");
                             }
 
-                            discardConnection(poolableConnection.holder);
+                            discardConnection(poolableConnection.holder); //[ADU]如果探测失败，则丢弃连接并重新获取。
                              continue;
                         }
                     }
                 }
             }
 
+            //[ADU]是否打开连接泄露检查。DestroyConnectionThread如果检测到连接借出时间超过removeAbandonedTimeout，则强制归还连接到连接池中。
+            //[ADU]对性能会有一些影响，建议怀疑存在泄漏之后再打开，不建议在生产环境中使用。
             if (removeAbandoned) {
-                StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
+                StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace(); //[ADU]保存发起方的线程栈
                 poolableConnection.connectStackTrace = stackTrace;
-                poolableConnection.setConnectedTimeNano();
+                poolableConnection.setConnectedTimeNano(); //[ADU]重置借出时间
                 poolableConnection.traceEnable = true;
 
                 activeConnectionLock.lock();
                 try {
-                    activeConnections.put(poolableConnection, PRESENT);
+                    activeConnections.put(poolableConnection, PRESENT); //[ADU]放进activeConnections
                 } finally {
                     activeConnectionLock.unlock();
                 }
@@ -2493,6 +2498,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         return put(holder, physicalConnectionInfo.createTaskId);
     }
 
+     //[ADU]将连接放入连接池尾部
     private boolean put(DruidConnectionHolder holder, long createTaskId) {
         lock.lock();
         try {
@@ -2915,6 +2921,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         }
     }
 
+     //[ADU]关闭泄漏（借出后长时间未归还）的连接
     public int removeAbandoned() {
         int removeCount = 0;
 
@@ -2933,7 +2940,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     continue;
                 }
 
-                long timeMillis = (currrentNanos - pooledConnection.getConnectedTimeNano()) / (1000 * 1000);
+                long timeMillis = (currrentNanos - pooledConnection.getConnectedTimeNano()) / (1000 * 1000); //[ADU]连接借出时间
 
                 if (timeMillis >= removeAbandonedTimeoutMillis) {
                     iter.remove();
@@ -2957,7 +2964,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     lock.unlock();
                 }
 
-                JdbcUtils.close(pooledConnection);
+                JdbcUtils.close(pooledConnection); //[ADU]直接关闭
                 pooledConnection.abandond();
                 removeAbandonedCount++;
                 removeCount++;
@@ -2970,6 +2977,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     buf.append(pooledConnection.getConnectedTimeMillis());
                     buf.append(", open stackTrace\n");
 
+                     //[ADU]借出时的线程栈
                     StackTraceElement[] trace = pooledConnection.getConnectStackTrace();
                     for (int i = 0; i < trace.length; i++) {
                         buf.append("\tat ");
@@ -2977,6 +2985,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                         buf.append("\n");
                     }
 
+                     //[ADU]获取连接线程的当前线程栈
                     buf.append("ownerThread current state is " + pooledConnection.getOwnerThread().getState()
                                + ", current stackTrace\n");
                     trace = pooledConnection.getOwnerThread().getStackTrace();
@@ -3059,9 +3068,9 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             return;
         }
 
-        boolean needFill = false;
-        int evictCount = 0;
-        int keepAliveCount = 0;
+        boolean needFill = false; //[ADU]是否需要发送empty条件信号，补充创建新的连接
+        int evictCount = 0; //[ADU]需要逐出的连接个数
+        int keepAliveCount = 0; //[ADU]需要探测的连接个数
         int fatalErrorIncrement = fatalErrorCount - fatalErrorCountLastShrink;
         fatalErrorCountLastShrink = fatalErrorCount;
         
@@ -3070,7 +3079,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 return;
             }
 
-            final int checkCount = poolingCount - minIdle;
+            final int checkCount = poolingCount - minIdle; //[ADU]重点检查后minIdle个之前的连接
             final long currentTimeMillis = System.currentTimeMillis();
             for (int i = 0; i < poolingCount; ++i) {
                 DruidConnectionHolder connection = connections[i];
@@ -3081,7 +3090,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 }
 
                 if (checkTime) {
-                    if (phyTimeoutMillis > 0) {
+                    if (phyTimeoutMillis > 0) { //[ADU]如果连接的物理存活时间超过限值，将被逐出。
                         long phyConnectTimeMillis = currentTimeMillis - connection.connectTimeMillis;
                         if (phyConnectTimeMillis > phyTimeoutMillis) {
                             evictConnections[evictCount++] = connection;
@@ -3089,25 +3098,26 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                         }
                     }
 
-                    long idleMillis = currentTimeMillis - connection.lastActiveTimeMillis;
+                    long idleMillis = currentTimeMillis - connection.lastActiveTimeMillis; //[ADU]空闲时间
 
+                     //[ADU]如果空闲时间过短，直接跳过
                     if (idleMillis < minEvictableIdleTimeMillis
                             && idleMillis < keepAliveBetweenTimeMillis
                     ) {
                         break;
                     }
 
-                    if (idleMillis >= minEvictableIdleTimeMillis) {
-                        if (checkTime && i < checkCount) {
+                    if (idleMillis >= minEvictableIdleTimeMillis) { //[ADU]如果连接空闲时间超过minEvictableIdleTimeMillis
+                        if (checkTime && i < checkCount) { //[ADU]留尾部的minIdle个连接先不逐出
                             evictConnections[evictCount++] = connection;
                             continue;
-                        } else if (idleMillis > maxEvictableIdleTimeMillis) {
+                        } else if (idleMillis > maxEvictableIdleTimeMillis) { //[ADU]尾部的minIdle个连接如果连接空闲时间>maxEvictableIdleTimeMillis，也会被逐出
                             evictConnections[evictCount++] = connection;
                             continue;
                         }
                     }
 
-                    if (keepAlive && idleMillis >= keepAliveBetweenTimeMillis) {
+                    if (keepAlive && idleMillis >= keepAliveBetweenTimeMillis) { //[ADU]如果连接空闲时间未超过minEvictableIdleTimeMillis，但超过了keepAliveBetweenTimeMillis就要进行探活
                         keepAliveConnections[keepAliveCount++] = connection;
                     }
                 } else {
@@ -3120,7 +3130,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             }
 
             int removeCount = evictCount + keepAliveCount;
-            if (removeCount > 0) {
+            if (removeCount > 0) { //[ADU]把逐出的和需要探测的移除出可用连接池
                 System.arraycopy(connections, removeCount, connections, 0, poolingCount - removeCount);
                 Arrays.fill(connections, poolingCount - removeCount, poolingCount, null);
                 poolingCount -= removeCount;
@@ -3134,7 +3144,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             lock.unlock();
         }
 
-        if (evictCount > 0) {
+        if (evictCount > 0) { //[ADU]如果有需要逐出的，则进行关闭连接操作。
             for (int i = 0; i < evictCount; ++i) {
                 DruidConnectionHolder item = evictConnections[i];
                 Connection connection = item.getConnection();
@@ -3144,7 +3154,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             Arrays.fill(evictConnections, null);
         }
 
-        if (keepAliveCount > 0) {
+        if (keepAliveCount > 0) { //[ADU]如果有需要探测的，则进行探测。探活的，则放回可用池；探不活的，直接关闭，并通知创建。
             // keep order
             for (int i = keepAliveCount - 1; i >= 0; --i) {
                 DruidConnectionHolder holer = keepAliveConnections[i];
@@ -3162,16 +3172,16 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     // skip
                 }
 
-                boolean discard = !validate;
+                boolean discard = !validate; //[ADU]是否需要丢弃
                 if (validate) {
                     holer.lastKeepTimeMillis = System.currentTimeMillis();
-                    boolean putOk = put(holer, 0L);
+                    boolean putOk = put(holer, 0L); //[ADU]探测成功，重新放回可用连接池
                     if (!putOk) {
                         discard = true;
                     }
                 }
 
-                if (discard) {
+                if (discard) { //[ADU]探测不成功，则关闭连接
                     try {
                         connection.close();
                     } catch (Exception e) {
@@ -3182,7 +3192,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     try {
                         discardCount++;
 
-                        if (activeCount + poolingCount <= minIdle) {
+                        if (activeCount + poolingCount <= minIdle) { //[ADU]如果可用连接池里不够minIdle个，则发送empty条件信号。
                             emptySignal();
                         }
                     } finally {
@@ -3197,7 +3207,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         if (needFill) {
             lock.lock();
             try {
-                int fillCount = minIdle - (activeCount + poolingCount + createTaskCount);
+                int fillCount = minIdle - (activeCount + poolingCount + createTaskCount); //[ADU]需要补充创建的连接个数
                 for (int i = 0; i < fillCount; ++i) {
                     emptySignal();
                 }
