@@ -788,7 +788,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         this.connectProperties = properties;
     }
 
-     //[ADU]初始化。1）创建minIdle条连接；2）启动LogStatsThread、CreateConnectionThread、CreateConnectionThread三个线程。
+     //[ADU]初始化。1）创建initialSize条连接；2）启动LogStatsThread、CreateConnectionThread、DestroyConnectionThread三个线程。
     public void init() throws SQLException {
         if (inited) {
             return;
@@ -934,7 +934,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
             createAndLogThread(); //[ADU]如果timeBetweenLogStatsMillis>0，开启守护线程LogStatsThread打印stat日志，线程前缀为Druid-ConnectionPool-Log-。
             createAndStartCreatorThread(); //[ADU]开启守护线程CreateConnectionThread，如果收到empty条件信号会创建新的连接放入线程池。线程前缀为Druid-ConnectionPool-Create-。
-            createAndStartDestroyThread(); //[ADU]开启守护线程CreateConnectionThread，如果收到empty条件信号会创建新的连接放入线程池。线程前缀为Druid-ConnectionPool-Destroy-。
+            createAndStartDestroyThread(); //[ADU]开启守护线程DestroyConnectionThread，定时扫描连接池进行探测和逐出。线程前缀为Druid-ConnectionPool-Destroy-。
 
             initedLatch.await(); //[ADU]等待CreateConnectionThread和CreateConnectionThread都启动起来。
             init = true;
@@ -1623,7 +1623,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
             try {
                 if (maxWaitThreadCount > 0
-                        && notEmptyWaitThreadCount >= maxWaitThreadCount) {
+                        && notEmptyWaitThreadCount >= maxWaitThreadCount) { //[ADU]如果等待获取连接的线程数超过maxWaitThreadCount，则抛出异常
                     connectErrorCountUpdater.incrementAndGet(this);
                     throw new SQLException("maxWaitThreadCount " + maxWaitThreadCount + ", current wait Thread count "
                             + lock.getQueueLength());
@@ -1922,7 +1922,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 return;
             }
 
-            if (phyMaxUseCount > 0 && holder.useCount >= phyMaxUseCount) {
+            if (phyMaxUseCount > 0 && holder.useCount >= phyMaxUseCount) { //[ADU]限制连接的最大使用次数。超过此值，会被直接关闭。
                 discardConnection(holder);
                 return;
             }
@@ -1941,7 +1941,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 return;
             }
 
-            if (testOnReturn) {
+            if (testOnReturn) { //[ADU]如果testOnReturn=true，归还前也检测下
                 boolean validate = testConnectionInternal(holder, physicalConnection);
                 if (!validate) {
                     JdbcUtils.close(physicalConnection);
@@ -1974,7 +1974,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             boolean result;
             final long currentTimeMillis = System.currentTimeMillis();
 
-            if (phyTimeoutMillis > 0) {
+            if (phyTimeoutMillis > 0) { //[ADU]检测物理存活时间
                 long phyConnectTimeMillis = currentTimeMillis - holder.connectTimeMillis;
                 if (phyConnectTimeMillis > phyTimeoutMillis) {
                     discardConnection(holder);
@@ -2149,6 +2149,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         return mbeanRegistered;
     }
 
+     //[ADU]将连接放入可用连接池尾部，并发送notEmpty条件信号
     boolean putLast(DruidConnectionHolder e, long lastActiveTimeMillis) {
         if (poolingCount >= maxActive || e.discard) {
             return false;
@@ -2172,7 +2173,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
      //[ADU]阻塞等待尾部连接
     DruidConnectionHolder takeLast() throws InterruptedException, SQLException {
         try {
-            while (poolingCount == 0) {  //[ADU]如果没有可用连接，就发送个empty条件信号给CreateThread，并等待notEmpty条件信号
+            while (poolingCount == 0) {  //[ADU]如果没有可用连接，就发送个empty条件信号给CreateConnectionThread，并等待notEmpty条件信号
                 emptySignal(); // send signal to CreateThread create connection
 
                 if (failFast && isFailContinuous()) {
@@ -2503,7 +2504,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         return put(holder, physicalConnectionInfo.createTaskId);
     }
 
-     //[ADU]将连接放入连接池尾部
+     //[ADU]将连接放入连接池尾部，并发送notEmpty条件信号
     private boolean put(DruidConnectionHolder holder, long createTaskId) {
         lock.lock();
         try {
@@ -2513,8 +2514,8 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 }
                 return false;
             }
-            connections[poolingCount] = holder;
-            incrementPoolingCount();
+            connections[poolingCount] = holder; //[ADU]放入连接池尾部
+            incrementPoolingCount(); //[ADU]可用连接数poolingCount+1
 
             if (poolingCount > poolingPeak) {
                 poolingPeak = poolingCount;
@@ -2724,6 +2725,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         }
     }
 
+     //[ADU]后台负责创建连接的线程。监听empty条件信号，收到信号后，如果满足条件则创建一个新连接；如果不满足，则忽略此次信号。
     public class CreateConnectionThread extends Thread {
 
         public CreateConnectionThread(String name){
@@ -2772,9 +2774,9 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                         }
 
                         // 防止创建超过maxActive数量的连接
-                        if (activeCount + poolingCount >= maxActive) {
+                        if (activeCount + poolingCount >= maxActive) { //[ADU]如果不满足条件，则忽略此次信号并继续await()
                             empty.await();
-                            continue;
+                            continue; //[ADU]再次收到empty条件信号后，重新回到for (;;)处
                         }
                     }
 
@@ -2835,7 +2837,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     continue;
                 }
 
-                boolean result = put(connection);
+                boolean result = put(connection); //[ADU]放入可用连接池
                 if (!result) {
                     JdbcUtils.close(connection.getPhysicalConnection());
                     LOG.info("put physical connection to pool failed.");

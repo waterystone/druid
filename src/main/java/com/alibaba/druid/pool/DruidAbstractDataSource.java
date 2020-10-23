@@ -1649,7 +1649,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     public Connection createPhysicalConnection(String url, Properties info) throws SQLException {
         Connection conn;
         if (getProxyFilters().size() == 0) {
-            conn = getDriver().connect(url, info);
+            conn = getDriver().connect(url, info); //[ADU]创建一条连接
         } else {
             conn = new FilterChainImpl(this).connection_connect(info);
         }
@@ -1723,10 +1723,10 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
                 throw new SQLException("connect error, url " + url + ", driverClass " + this.driverClass);
             }
 
-            initPhysicalConnection(conn, variables, globalVariables);
+            initPhysicalConnection(conn, variables, globalVariables); //[ADU]初始化连接
             initedNanos = System.nanoTime();
 
-            validateConnection(conn);
+            validateConnection(conn); //[ADU]检测一下
             validatedNanos = System.nanoTime();
 
             setFailContinuous(false);
