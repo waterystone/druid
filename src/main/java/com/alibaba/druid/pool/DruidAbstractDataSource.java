@@ -1659,6 +1659,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         return conn;
     }
 
+     //[ADU]创建一条连接，并初始化
     public PhysicalConnectionInfo createPhysicalConnection() throws SQLException {
         String url = this.getUrl();
         Properties connectProperties = getConnectProperties();
@@ -1715,7 +1716,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         createStartNanosUpdater.set(this, connectStartNanos);
         creatingCountUpdater.incrementAndGet(this);
         try {
-            conn = createPhysicalConnection(url, physicalConnectProperties);
+            conn = createPhysicalConnection(url, physicalConnectProperties); //[ADU]创建一条物理连接
             connectedNanos = System.nanoTime();
 
             if (conn == null) {
@@ -1842,7 +1843,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         try {
             stmt = conn.createStatement();
 
-            for (String sql : initSqls) {
+            for (String sql : initSqls) { //[ADU]执行connectionInitSqls指定的初始SQL列表
                 if (sql == null) {
                     continue;
                 }
@@ -1852,7 +1853,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
 
             DbType dbType = DbType.of(this.dbTypeName);
             if (dbType == DbType.mysql || dbType == DbType.ads) {
-                if (variables != null) {
+                if (variables != null) { //[ADU]加载variables
                     ResultSet rs = null;
                     try {
                         rs = stmt.executeQuery("show variables");
@@ -1866,7 +1867,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
                     }
                 }
 
-                if (globalVariables != null) {
+                if (globalVariables != null) { //[ADU]加载globalVariables
                     ResultSet rs = null;
                     try {
                         rs = stmt.executeQuery("show global variables");
